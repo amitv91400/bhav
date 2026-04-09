@@ -18,7 +18,7 @@ app.use((req, res, next) => {
     next();
 });
 
-const KATAULA_TIME = 3000; 
+const KATAULA_TIME = 2500; 
 let cachedData = { status: "success", data: [] }; 
 let jumpTracker = {}; 
 let globalLatestTimeStr = "00:00:00"; 
