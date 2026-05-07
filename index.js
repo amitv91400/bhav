@@ -47,7 +47,7 @@ function getISTTime() {
 }
 
 async function fetchFromGas(gasObj) {
-    const res = await axios.get(gasObj.url, { timeout: 12000 });
+    const res = await axios.get(gasObj.url, { timeout: 10000 });
     if (res.data && Array.isArray(res.data.data)) return res.data;
     throw new Error("Invalid Format");
 }
