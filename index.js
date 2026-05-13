@@ -6,10 +6,7 @@ const WebSocket = require('ws');
 const zlib = require('zlib'); 
 const app = express();
 
-// --- RENDER MODIFICATION ---
 const PORT = process.env.PORT || 8080; 
-// ---------------------------
-
 app.use(compression());
 
 app.use((req, res, next) => {
@@ -23,7 +20,6 @@ let cachedData = { status: "success", data: [] };
 let jumpTracker = {}; 
 let globalLatestTimeStr = "00:00:00"; 
 let currentIndex = 0; 
-
 let lastBroadcastedDataMap = new Map(); 
 
 const JUMP_THRESHOLD = 0.30; 
@@ -46,6 +42,17 @@ function getISTTime() {
     return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
 }
 
+// Function to handle Time Logic
+function getProcessedTime(rawTime) {
+    if (!rawTime) return "23:30:00";
+    
+    // Raat ke 11:30:00 se subha 08:59:56 tak logic
+    if (rawTime > "23:30:00" || rawTime < "08:59:56") {
+        return "23:30:00";
+    }
+    return rawTime;
+}
+
 async function fetchFromGas(gasObj) {
     const res = await axios.get(gasObj.url, { timeout: 10000 });
     if (res.data && Array.isArray(res.data.data)) return res.data;
@@ -61,9 +68,6 @@ function broadcastData(newData) {
             oldItem.ltp !== newItem.ltp ||
             oldItem.bid !== newItem.bid ||
             oldItem.ask !== newItem.ask ||
-            oldItem.high !== newItem.high ||
-            oldItem.low !== newItem.low ||
-            oldItem.close !== newItem.close ||
             oldItem.time !== newItem.time;
 
         return hasChanged || newItem.id === "TIME"; 
@@ -91,11 +95,8 @@ async function updateCacheInBackground() {
     const nowIST = getISTTime();
     const currentTimestamp = Date.now();
     
-    const currentHour = nowIST.getHours();
-    const currentMin = nowIST.getMinutes();
-    const currentSec = nowIST.getSeconds();
-
-    const isMorningOpening = (currentHour === 9 && (currentMin === 0 || (currentMin === 1 && currentSec <= 30)));
+    const timeNowStr = nowIST.toTimeString().split(' ')[0]; // HH:MM:SS format
+    const isMorningOpening = (timeNowStr >= "08:59:56" && timeNowStr <= "09:01:00");
 
     const selectedUrl = gasUrls[currentIndex];
     currentIndex = (currentIndex + 1) % gasUrls.length;
@@ -108,7 +109,7 @@ async function updateCacheInBackground() {
             if (d.time && d.time > incomingMaxTimeStr) incomingMaxTimeStr = d.time;
         });
 
-        // --- LATEST TIME PROTECTION ---
+        // 1. CATCH LATEST DATA ONLY: Agar incoming data purana hai global time se, to reject karein
         if (!isMorningOpening && incomingMaxTimeStr < globalLatestTimeStr && globalLatestTimeStr !== "00:00:00") {
             return; 
         }
@@ -119,11 +120,12 @@ async function updateCacheInBackground() {
 
             if (!newItem) return oldItem;
 
-            // Individual symbol time check
+            // Freshness Check for individual symbol
             if (!isMorningOpening && oldItem && newItem.time && newItem.time < oldItem.time) {
                 return oldItem;
             }
 
+            // Jump Tracker Logic (unchanged as per your stable code)
             if (isMorningOpening) {
                 delete jumpTracker[symbolId];
             } else if (oldItem) {
@@ -143,7 +145,6 @@ async function updateCacheInBackground() {
                             }
                         }
                     }
-
                     if (hasJump) {
                         if (!jumpTracker[symbolId]) {
                             jumpTracker[symbolId] = { startTime: currentTimestamp, count: 1, lastLtp: parseFloat(newItem.ltp) };
@@ -153,24 +154,31 @@ async function updateCacheInBackground() {
                             const currentLtp = parseFloat(newItem.ltp) || 0;
                             if (Math.abs(currentLtp - trk.lastLtp) < 0.10) trk.count++;
                             else { trk.count = 1; trk.lastLtp = currentLtp; }
-
-                            if (trk.count < STABILITY_COUNT_REQUIRED && (currentTimestamp - trk.startTime) < 45000) {
-                                return oldItem;
-                            }
+                            if (trk.count < STABILITY_COUNT_REQUIRED && (currentTimestamp - trk.startTime) < 45000) return oldItem;
                             delete jumpTracker[symbolId];
                         }
-                    } else {
-                        delete jumpTracker[symbolId];
-                    }
+                    } else { delete jumpTracker[symbolId]; }
                 }
             }
 
             let mergedItem = oldItem ? { ...oldItem } : { ...newItem };
-            ['ltp', 'bid', 'ask', 'high', 'low', 'close', 'time'].forEach(field => {
-                if (!isInvalid(newItem[field])) {
-                    mergedItem[field] = newItem[field];
-                }
+            
+            // Logic: Price change check for Time update
+            let priceChanged = oldItem && (oldItem.ltp !== newItem.ltp || oldItem.bid !== newItem.bid || oldItem.ask !== newItem.ask);
+
+            ['ltp', 'bid', 'ask', 'high', 'low', 'close'].forEach(field => {
+                if (!isInvalid(newItem[field])) mergedItem[field] = newItem[field];
             });
+
+            // TIME Logic as per your request
+            let processedTime = getProcessedTime(newItem.time || oldItem?.time);
+            
+            // Agar 11:30 ke baad hai aur price change nahi hua, to time purana hi rakhein (23:30:00)
+            if ((timeNowStr > "23:30:00" || timeNowStr < "08:59:56") && !priceChanged && oldItem) {
+                mergedItem.time = oldItem.time;
+            } else {
+                mergedItem.time = processedTime;
+            }
 
             const finalLtp = parseFloat(mergedItem.ltp) || 0;
             const finalClose = parseFloat(mergedItem.close) || 0;
@@ -193,11 +201,14 @@ async function updateCacheInBackground() {
         }
 
         let finalResult = finalDataList.filter(d => d !== null);
-        finalResult.push({ id: "TIME", time: globalLatestTimeStr, ltp: "0.00", pcnt_chg: "0.00" });
+        
+        // Global Time display logic
+        let displayGlobalTime = getProcessedTime(globalLatestTimeStr);
+        finalResult.push({ id: "TIME", time: displayGlobalTime, ltp: "0.00", pcnt_chg: "0.00" });
 
         cachedData = { status: "success", data: finalResult };
         broadcastData(cachedData); 
-        console.log(`Update: GAS ID ${selectedUrl.id} at ${globalLatestTimeStr}`);
+        console.log(`Update: GAS ID ${selectedUrl.id} | Display Time: ${displayGlobalTime}`);
 
     } catch (err) {
         console.log(`Fetch failed for GAS ID ${selectedUrl.id}`);
@@ -218,7 +229,6 @@ wss.on('connection', (ws) => {
 setInterval(updateCacheInBackground, KATAULA_TIME);
 app.get('/flight-data', (req, res) => res.json(cachedData));
 
-// --- RENDER MODIFICATION ---
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server Live on port ${PORT}`);
 });
