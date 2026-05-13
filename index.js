@@ -16,6 +16,7 @@ app.use((req, res, next) => {
 });
 
 const KATAULA_TIME = 2500; 
+const BOOTSTRAP_URL = "https://api.databhavwow.top/live_v3.json"; // Server jagne par yahan se data lega
 let cachedData = { status: "success", data: [] }; 
 let jumpTracker = {}; 
 let globalLatestTimeStr = "00:00:00"; 
@@ -42,19 +43,17 @@ function getISTTime() {
     return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
 }
 
-// Function to handle Time Logic
 function getProcessedTime(rawTime) {
     if (!rawTime) return "23:30:00";
-    
-    // Raat ke 11:30:00 se subha 08:59:56 tak logic
     if (rawTime > "23:30:00" || rawTime < "08:59:56") {
         return "23:30:00";
     }
     return rawTime;
 }
 
-async function fetchFromGas(gasObj) {
-    const res = await axios.get(gasObj.url, { timeout: 10000 });
+// Fetch helper that can handle both GAS and Bootstrap URL
+async function fetchData(url) {
+    const res = await axios.get(url, { timeout: 10000 });
     if (res.data && Array.isArray(res.data.data)) return res.data;
     throw new Error("Invalid Format");
 }
@@ -63,22 +62,15 @@ function broadcastData(newData) {
     const deltaData = newData.data.filter(newItem => {
         const oldItem = lastBroadcastedDataMap.get(newItem.id);
         if (!oldItem) return true;
-
         const hasChanged = 
             oldItem.ltp !== newItem.ltp ||
             oldItem.bid !== newItem.bid ||
             oldItem.ask !== newItem.ask ||
             oldItem.time !== newItem.time;
-
         return hasChanged || newItem.id === "TIME"; 
     });
-
     if (deltaData.length === 0) return;
-
-    newData.data.forEach(item => {
-        lastBroadcastedDataMap.set(item.id, { ...item });
-    });
-
+    newData.data.forEach(item => { lastBroadcastedDataMap.set(item.id, { ...item }); });
     const jsonString = JSON.stringify({ status: "success", data: deltaData });
     zlib.deflate(jsonString, { level: 1 }, (err, buffer) => {
         if (!err) {
@@ -94,22 +86,30 @@ function broadcastData(newData) {
 async function updateCacheInBackground() {
     const nowIST = getISTTime();
     const currentTimestamp = Date.now();
-    
-    const timeNowStr = nowIST.toTimeString().split(' ')[0]; // HH:MM:SS format
-    const isMorningOpening = (timeNowStr >= "08:59:56" && timeNowStr <= "09:01:00");
+    const timeNowStr = nowIST.toTimeString().split(' ')[0]; 
 
-    const selectedUrl = gasUrls[currentIndex];
-    currentIndex = (currentIndex + 1) % gasUrls.length;
+    // Logic: 09:00:00 se 09:01:30 tak jump-free opening
+    const isMorningOpening = (timeNowStr >= "09:00:00" && timeNowStr <= "09:01:30");
+    
+    // Subha 9 baje se pehle API se data layega, uske baad GAS se
+    const isBeforeMarket = (timeNowStr < "09:00:00" && timeNowStr > "01:00:00");
+    
+    let targetUrl;
+    if (isBeforeMarket) {
+        targetUrl = BOOTSTRAP_URL;
+    } else {
+        targetUrl = gasUrls[currentIndex].url;
+        currentIndex = (currentIndex + 1) % gasUrls.length;
+    }
 
     try {
-        const newData = await fetchFromGas(selectedUrl);
-        
+        const newData = await fetchData(targetUrl);
         let incomingMaxTimeStr = "00:00:00";
         newData.data.forEach(d => {
             if (d.time && d.time > incomingMaxTimeStr) incomingMaxTimeStr = d.time;
         });
 
-        // 1. CATCH LATEST DATA ONLY: Agar incoming data purana hai global time se, to reject karein
+        // Skip if data is older (unless it's morning reset)
         if (!isMorningOpening && incomingMaxTimeStr < globalLatestTimeStr && globalLatestTimeStr !== "00:00:00") {
             return; 
         }
@@ -120,12 +120,12 @@ async function updateCacheInBackground() {
 
             if (!newItem) return oldItem;
 
-            // Freshness Check for individual symbol
+            // Freshness check for symbol
             if (!isMorningOpening && oldItem && newItem.time && newItem.time < oldItem.time) {
                 return oldItem;
             }
 
-            // Jump Tracker Logic (unchanged as per your stable code)
+            // Stability check bypass during opening
             if (isMorningOpening) {
                 delete jumpTracker[symbolId];
             } else if (oldItem) {
@@ -162,18 +162,13 @@ async function updateCacheInBackground() {
             }
 
             let mergedItem = oldItem ? { ...oldItem } : { ...newItem };
-            
-            // Logic: Price change check for Time update
             let priceChanged = oldItem && (oldItem.ltp !== newItem.ltp || oldItem.bid !== newItem.bid || oldItem.ask !== newItem.ask);
 
             ['ltp', 'bid', 'ask', 'high', 'low', 'close'].forEach(field => {
                 if (!isInvalid(newItem[field])) mergedItem[field] = newItem[field];
             });
 
-            // TIME Logic as per your request
             let processedTime = getProcessedTime(newItem.time || oldItem?.time);
-            
-            // Agar 11:30 ke baad hai aur price change nahi hua, to time purana hi rakhein (23:30:00)
             if ((timeNowStr > "23:30:00" || timeNowStr < "08:59:56") && !priceChanged && oldItem) {
                 mergedItem.time = oldItem.time;
             } else {
@@ -201,17 +196,15 @@ async function updateCacheInBackground() {
         }
 
         let finalResult = finalDataList.filter(d => d !== null);
-        
-        // Global Time display logic
         let displayGlobalTime = getProcessedTime(globalLatestTimeStr);
         finalResult.push({ id: "TIME", time: displayGlobalTime, ltp: "0.00", pcnt_chg: "0.00" });
 
         cachedData = { status: "success", data: finalResult };
         broadcastData(cachedData); 
-        console.log(`Update: GAS ID ${selectedUrl.id} | Display Time: ${displayGlobalTime}`);
+        console.log(`Source: ${isBeforeMarket ? 'API' : 'GAS'} | Display Time: ${displayGlobalTime}`);
 
     } catch (err) {
-        console.log(`Fetch failed for GAS ID ${selectedUrl.id}`);
+        console.log(`Fetch failed for ${targetUrl}`);
     }
 }
 
@@ -226,7 +219,12 @@ wss.on('connection', (ws) => {
     });
 });
 
+// Start background task
 setInterval(updateCacheInBackground, KATAULA_TIME);
+
+// Initial bootstrap call to fill cache immediately on startup
+updateCacheInBackground();
+
 app.get('/flight-data', (req, res) => res.json(cachedData));
 
 server.listen(PORT, '0.0.0.0', () => {
